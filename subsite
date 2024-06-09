@@ -1,0 +1,114 @@
+#!/usr/bin/env groovy
+@Grab(group='com.github.mwiede', module='jsch', version='0.2.17')
+// Algorithm negotiation fail?  Try updating the version above.
+// See https://mvnrepository.com/artifact/com.github.mwiede/jsch
+
+import com.jcraft.jsch.*
+import groovy.io.FileType
+import groovy.json.JsonSlurper
+import javax.swing.*
+
+record Credentials(String host, String port, String user, String password) {}
+record SubSiteArgs(String sourceFolder, String targetFolder, Credentials creds) {}
+
+String enterPassword() {
+    JPasswordField passwordField = new JPasswordField(40);
+    if (0 != JOptionPane.showOptionDialog(null, new JPanel().with {
+        add(new JLabel("Enter your SFTP password"))
+        add(passwordField)
+    }, "Password for SubSite upload",
+    JOptionPane.NO_OPTION, JOptionPane.PLAIN_MESSAGE, null, "OK Cancel".split(), null)) {
+        println("SubSite cancelled. (No password supplied.)")
+        System.exit(-1)
+    }
+    return new String(passwordField.getPassword())
+}
+
+Map<String,String> argsMap(String[] args) { // Read command line arguments in format: name=value
+    Map<String,String> map = new HashMap<>()
+    args.each { arg -> 
+        def match = arg =~ /(.*)=(.*)/
+        if (match.size() == 1) map.put(match[0][1].toLowerCase(), match[0][2])
+    }
+    return map
+}
+
+String firstNonNull(String... values) {
+    return Arrays.stream(values).filter(Objects::nonNull).findFirst().orElse(null)
+}
+
+SubSiteArgs readSubsiteArgs() {
+    File credentialsFile = new File(System.getProperty("user.home"), "subsitecredentials.json")
+    def defaultCredentials = credentialsFile.exists() ? new JsonSlurper().parse(credentialsFile) : new Credentials(null, null, null, null)
+    def commandArgs = argsMap(this.args)
+    def environment = System.getenv()
+
+    def source = firstNonNull(commandArgs.get("source"), environment.get("SUBSITE_SOURCE"))
+    def target = firstNonNull(commandArgs.get("target"), environment.get("SUBSITE_TARGET"))
+    def host = firstNonNull(commandArgs.get("host"), environment.get("SUBSITE_HOST"), defaultCredentials.host)
+    def port = firstNonNull(commandArgs.get("port"), environment.get("SUBSITE_PORT"), defaultCredentials.port, "222")
+    def user = firstNonNull(commandArgs.get("user"), environment.get("SUBSITE_USER"), defaultCredentials.user)
+    def password = firstNonNull(commandArgs.get("password"), environment.get("SUBSITE_PASSWORD"), defaultCredentials.password)
+
+    if (source == null || target == null || host == null || port == null || user == null) {
+        println "Required value not supplied. source:${source} target:${target} host:${host} port:${port} user:${user}"
+        System.exit(-1)
+    }
+    if (password == null) password = enterPassword()
+
+    return new SubSiteArgs(source, target, new Credentials(host, port, user, password))
+}
+
+void withSftpConnection(Credentials creds, Closure action) {
+    java.util.Properties config = new java.util.Properties()
+    config.put "StrictHostKeyChecking", "no"
+
+    JSch ssh = new JSch()
+    Session sess = ssh.getSession creds.user, creds.host, creds.port as Integer
+    sess.with {
+        setConfig config
+        setPassword creds.password
+        connect()
+        Channel chan = openChannel "sftp"
+        chan.connect()
+        ChannelSftp sftp = (ChannelSftp) chan;
+
+        action.call(sftp)
+
+        chan.disconnect()
+        disconnect()
+    }
+}
+
+String sourceToTarget(File file, String sourceFolder, String targetFolder) {
+    return targetFolder + file.path.replace('\\','/').substring(sourceFolder.length())
+}
+
+void mkdirAll(ChannelSftp sftp, String sourceFolder, String targetFolder) {
+    def folders = [targetFolder]
+    new File(sourceFolder).eachFileRecurse(FileType.DIRECTORIES) { file -> folders << sourceToTarget(file, sourceFolder, targetFolder) }
+        // targetFolder + file.path.replace('\\','/').substring(sourceFolder.length()) }
+    folders.unique()
+    folders.each { try {
+        println "MKDIR $it"
+        sftp.mkdir( it )
+    } catch (SftpException e) {
+        // Do nothing; Assume already exists.
+    }}
+}
+
+void uploadAll(ChannelSftp sftp, String sourceFolder, String targetFolder) {
+    def sources = []
+    new File(sourceFolder).eachFileRecurse(FileType.FILES) { file -> sources << file }
+    sources.each { source ->
+        def target = sourceToTarget(source, sourceFolder, targetFolder)
+        println "PUT $target"
+        source.withInputStream { istream -> sftp.put(istream, (String) "$target") }
+    }
+}
+
+def subsiteArgs = readSubsiteArgs()
+withSftpConnection(subsiteArgs.creds) { sftp -> {
+    mkdirAll(sftp, subsiteArgs.sourceFolder, subsiteArgs.targetFolder)
+    uploadAll(sftp, subsiteArgs.sourceFolder, subsiteArgs.targetFolder)
+}}
